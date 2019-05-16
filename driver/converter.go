@@ -51,7 +51,6 @@ var typeOfBytes = reflect.TypeOf((*[]byte)(nil)).Elem()
 
 func checkNamedValue(prmFieldSet *p.ParameterFieldSet, nv *driver.NamedValue) error {
 	idx := nv.Ordinal - 1
-
 	if idx >= prmFieldSet.NumInputField() {
 		return nil
 	}
@@ -71,7 +70,6 @@ func checkNamedValue(prmFieldSet *p.ParameterFieldSet, nv *driver.NamedValue) er
 
 func convertNamedValue(idx int, f *p.ParameterField, dt p.DataType, v driver.Value) (driver.Value, error) {
 	var err error
-
 	// let fields with own Value converter convert themselves first (e.g. NullInt64, ...)
 	if _, ok := v.(driver.Valuer); ok {
 		if v, err = driver.DefaultParameterConverter.ConvertValue(v); err != nil {
@@ -80,56 +78,42 @@ func convertNamedValue(idx int, f *p.ParameterField, dt p.DataType, v driver.Val
 	}
 
 	switch dt {
-
-	default:
-		return nil, fmt.Errorf("convert named value datatype error: %[1]d - %[1]s", dt)
-
 	case p.DtTinyint:
 		return convertNvInteger(v, minTinyint, maxTinyint)
-
 	case p.DtSmallint:
 		return convertNvInteger(v, minSmallint, maxSmallint)
-
 	case p.DtInteger:
 		return convertNvInteger(v, minInteger, maxInteger)
-
 	case p.DtBigint:
 		return convertNvInteger(v, minBigint, maxBigint)
-
 	case p.DtReal:
 		return convertNvFloat(v, maxReal)
-
 	case p.DtDouble:
 		return convertNvFloat(v, maxDouble)
-
 	case p.DtTime:
 		return convertNvTime(v)
-
 	case p.DtDecimal:
 		return convertNvDecimal(v)
-
 	case p.DtString:
 		return convertNvString(v)
-
 	case p.DtBytes:
 		return convertNvBytes(v)
-
 	case p.DtLob:
 		return convertNvLob(idx, f, v)
-
+	default:
+		return nil, fmt.Errorf("convert named value datatype error: %[1]d - %[1]s", dt)
 	}
 }
 
 // integer types
 func convertNvInteger(v interface{}, min, max int64) (driver.Value, error) {
-
 	if v == nil {
 		return v, nil
 	}
 
 	rv := reflect.ValueOf(v)
-	switch rv.Kind() {
 
+	switch rv.Kind() {
 	// bool is represented in HDB as tinyint
 	case reflect.Bool:
 		return rv.Bool(), nil
@@ -145,6 +129,16 @@ func convertNvInteger(v interface{}, min, max int64) (driver.Value, error) {
 			return nil, ErrIntegerOutOfRange
 		}
 		return int64(u64), nil
+	case reflect.Float32, reflect.Float64:
+		f64 := rv.Float()
+		i64 := int64(f64)
+		if f64 != float64(i64) {
+			return nil, fmt.Errorf("cannot convert float to int: %f does not fit in a 64-bit integer", f64)
+		}
+		if i64 > max || i64 < min {
+			return nil, ErrIntegerOutOfRange
+		}
+		return i64, nil
 	case reflect.Ptr:
 		// indirect pointers
 		if rv.IsNil() {
@@ -153,19 +147,18 @@ func convertNvInteger(v interface{}, min, max int64) (driver.Value, error) {
 		return convertNvInteger(rv.Elem().Interface(), min, max)
 	}
 
-	return nil, fmt.Errorf("unsupported integer conversion type error %[1]T %[1]v", v)
+	return nil, fmt.Errorf("cannot convert %[1]v (type %[1]T) to integer", v)
 }
 
 // float types
 func convertNvFloat(v interface{}, max float64) (driver.Value, error) {
-
 	if v == nil {
 		return v, nil
 	}
 
 	rv := reflect.ValueOf(v)
-	switch rv.Kind() {
 
+	switch rv.Kind() {
 	case reflect.Float32, reflect.Float64:
 		f64 := rv.Float()
 		if math.Abs(f64) > max {
@@ -180,27 +173,22 @@ func convertNvFloat(v interface{}, max float64) (driver.Value, error) {
 		return convertNvFloat(rv.Elem().Interface(), max)
 	}
 
-	return nil, fmt.Errorf("unsupported float conversion type error %[1]T %[1]v", v)
+	return nil, fmt.Errorf("cannot convert %[1]v (type %[1]T) to float", v)
 }
 
 // time
 func convertNvTime(v interface{}) (driver.Value, error) {
-
 	if v == nil {
 		return nil, nil
 	}
 
-	switch v := v.(type) {
-
-	case time.Time:
+	if v, ok := v.(time.Time); ok {
 		return v, nil
 	}
 
 	rv := reflect.ValueOf(v)
 
-	switch rv.Kind() {
-
-	case reflect.Ptr:
+	if rv.Kind() == reflect.Ptr {
 		// indirect pointers
 		if rv.IsNil() {
 			return nil, nil
@@ -213,12 +201,11 @@ func convertNvTime(v interface{}) (driver.Value, error) {
 		return tv.Interface().(time.Time), nil
 	}
 
-	return nil, fmt.Errorf("unsupported time conversion type error %[1]T %[1]v", v)
+	return nil, fmt.Errorf("cannot convert %[1]v (type %[1]T) to time", v)
 }
 
 // decimal
 func convertNvDecimal(v interface{}) (driver.Value, error) {
-
 	if v == nil {
 		return nil, nil
 	}
@@ -227,18 +214,16 @@ func convertNvDecimal(v interface{}) (driver.Value, error) {
 		return v, nil
 	}
 
-	return nil, fmt.Errorf("unsupported decimal conversion type error %[1]T %[1]v", v)
+	return nil, fmt.Errorf("cannot convert %[1]v (type %[1]T) to decimal", v)
 }
 
 // string
 func convertNvString(v interface{}) (driver.Value, error) {
-
 	if v == nil {
 		return v, nil
 	}
 
 	switch v := v.(type) {
-
 	case string, []byte:
 		return v, nil
 	}
@@ -246,15 +231,12 @@ func convertNvString(v interface{}) (driver.Value, error) {
 	rv := reflect.ValueOf(v)
 
 	switch rv.Kind() {
-
 	case reflect.String:
 		return rv.String(), nil
-
 	case reflect.Slice:
 		if rv.Type() == typeOfBytes {
 			return rv.Bytes(), nil
 		}
-
 	case reflect.Ptr:
 		// indirect pointers
 		if rv.IsNil() {
@@ -268,12 +250,11 @@ func convertNvString(v interface{}) (driver.Value, error) {
 		return bv.Interface().([]byte), nil
 	}
 
-	return nil, fmt.Errorf("unsupported character conversion type error %[1]T %[1]v", v)
+	return nil, fmt.Errorf("cannot convert %[1]v (type %[1]T) to string", v)
 }
 
 // bytes
 func convertNvBytes(v interface{}) (driver.Value, error) {
-
 	if v == nil {
 		return v, nil
 	}
@@ -285,12 +266,10 @@ func convertNvBytes(v interface{}) (driver.Value, error) {
 	rv := reflect.ValueOf(v)
 
 	switch rv.Kind() {
-
 	case reflect.Slice:
 		if rv.Type() == typeOfBytes {
 			return rv.Bytes(), nil
 		}
-
 	case reflect.Ptr:
 		// indirect pointers
 		if rv.IsNil() {
@@ -304,12 +283,11 @@ func convertNvBytes(v interface{}) (driver.Value, error) {
 		return bv.Interface().([]byte), nil
 	}
 
-	return nil, fmt.Errorf("unsupported bytes conversion type error %[1]T %[1]v", v)
+	return nil, fmt.Errorf("cannot convert %[1]v (type %[1]T) to bytes", v)
 }
 
 // Lob
 func convertNvLob(idx int, f *p.ParameterField, v interface{}) (driver.Value, error) {
-
 	if v == nil {
 		return v, nil
 	}
@@ -347,11 +325,7 @@ func convertNvLob(idx int, f *p.ParameterField, v interface{}) (driver.Value, er
 		return fmt.Sprintf("<lob %d", idx), nil
 	}
 
-	rv := reflect.ValueOf(v)
-
-	switch rv.Kind() {
-
-	case reflect.Ptr:
+	if rv := reflect.ValueOf(v); rv.Kind() == reflect.Ptr {
 		// indirect pointers
 		if rv.IsNil() {
 			return nil, nil
@@ -359,5 +333,5 @@ func convertNvLob(idx int, f *p.ParameterField, v interface{}) (driver.Value, er
 		return convertNvLob(idx, f, rv.Elem().Interface())
 	}
 
-	return nil, fmt.Errorf("unsupported lob conversion type error %[1]T %[1]v", v)
+	return nil, fmt.Errorf("cannot convert %[1]v (type %[1]T) to LOB", v)
 }

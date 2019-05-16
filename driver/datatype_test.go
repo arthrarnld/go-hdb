@@ -41,6 +41,7 @@ func TestTinyint(t *testing.T) {
 		uint8(maxTinyint),
 		sql.NullInt64{Valid: false, Int64: minTinyint},
 		sql.NullInt64{Valid: true, Int64: maxTinyint},
+		float64(maxTinyint),
 	)
 }
 
@@ -50,6 +51,7 @@ func TestSmallint(t *testing.T) {
 		int16(maxSmallint),
 		sql.NullInt64{Valid: false, Int64: minSmallint},
 		sql.NullInt64{Valid: true, Int64: maxSmallint},
+		float64(maxSmallint),
 	)
 }
 
@@ -59,6 +61,7 @@ func TestInteger(t *testing.T) {
 		int32(maxInteger),
 		sql.NullInt64{Valid: false, Int64: minInteger},
 		sql.NullInt64{Valid: true, Int64: maxInteger},
+		float64(maxInteger),
 	)
 }
 
@@ -68,6 +71,7 @@ func TestBigint(t *testing.T) {
 		int64(maxBigint),
 		sql.NullInt64{Valid: false, Int64: minBigint},
 		sql.NullInt64{Valid: true, Int64: maxBigint},
+		float64(maxInteger), // maxBigint does not fit
 	)
 }
 
