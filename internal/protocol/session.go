@@ -25,9 +25,12 @@ import (
 	"log"
 	"math"
 	"net"
+	"net/url"
 	"os"
 	"sync"
 	"time"
+
+	"golang.org/x/net/proxy"
 
 	"github.com/SAP/go-hdb/internal/bufio"
 	"github.com/SAP/go-hdb/internal/unicode"
@@ -75,17 +78,32 @@ type sessionConn struct {
 	inTx     bool  // in transaction
 }
 
-func newSessionConn(ctx context.Context, addr string, timeoutSec int, config *tls.Config) (*sessionConn, error) {
+func newSessionConn(ctx context.Context, addr string, timeoutSec int, tlsConfig *tls.Config, proxyURL *url.URL) (*sessionConn, error) {
+	var err error
+	var conn net.Conn
 	timeout := time.Duration(timeoutSec) * time.Second
-	dialer := net.Dialer{Timeout: timeout}
-	conn, err := dialer.DialContext(ctx, "tcp", addr)
+
+	if proxyURL == nil {
+		conn, err = (&net.Dialer{Timeout: timeout}).DialContext(ctx, "tcp", addr)
+	} else {
+		var d proxy.Dialer
+		var auth *proxy.Auth
+		if proxyURL.User != nil {
+			pw, _ := proxyURL.User.Password()
+			auth = &proxy.Auth{proxyURL.User.Username(), pw}
+		}
+		d, err = proxy.SOCKS5("tcp", proxyURL.Host, auth, proxy.Direct)
+		if err == nil {
+			conn, err = d.Dial("tcp", addr)
+		}
+	}
 	if err != nil {
 		return nil, err
 	}
 
 	// is TLS connection requested?
-	if config != nil {
-		conn = tls.Client(conn, config)
+	if tlsConfig != nil {
+		conn = tls.Client(conn, tlsConfig)
 	}
 
 	return &sessionConn{addr: addr, timeout: timeout, conn: conn}, nil
@@ -138,6 +156,7 @@ type sessionPrm interface {
 	FetchSize() int
 	Timeout() int
 	TLSConfig() *tls.Config
+	Proxy() *url.URL
 }
 
 // Session represents a HDB session.
@@ -189,7 +208,7 @@ func NewSession(ctx context.Context, prm sessionPrm) (*Session, error) {
 		outLogger.Printf("%s", prm)
 	}
 
-	conn, err := newSessionConn(ctx, prm.Host(), prm.Timeout(), prm.TLSConfig())
+	conn, err := newSessionConn(ctx, prm.Host(), prm.Timeout(), prm.TLSConfig(), prm.Proxy())
 	if err != nil {
 		return nil, err
 	}
