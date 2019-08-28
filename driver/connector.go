@@ -29,7 +29,7 @@ import (
 )
 
 /*
-SessionVaribles maps session variables to their values.
+SessionVariables maps session variables to their values.
 All defined session variables will be set once after a database connection is opened.
 */
 type SessionVariables map[string]string
@@ -40,7 +40,10 @@ A Connector can be passed to sql.OpenDB (starting from go 1.10) allowing users t
 */
 type Connector struct {
 	mu                             sync.RWMutex
-	host, username, password       string
+	host                           string
+	username                       string
+	password                       string
+	proxy                          *url.URL
 	locale                         string
 	bufferSize, fetchSize, timeout int
 	tlsConfig                      *tls.Config
@@ -296,6 +299,17 @@ func (c *Connector) BasicAuthDSN() string {
 		Host:     c.host,
 		RawQuery: values.Encode(),
 	}).String()
+}
+
+// Proxy returns the connector's proxy URL.
+func (c *Connector) Proxy() *url.URL {
+	return c.proxy
+}
+
+// SetProxy sets c to connect over the SOCKS5 proxy server pointed to
+// by p.
+func (c *Connector) SetProxy(p *url.URL) {
+	c.proxy = p
 }
 
 // Connect implements the database/sql/driver/Connector interface.
