@@ -22,17 +22,19 @@ import (
 	"fmt"
 	"testing"
 
-	goHdbDriver "github.com/SAP/go-hdb/driver"
+	hdb "github.com/SAP/go-hdb/driver"
+	"github.com/SAP/go-hdb/proxy"
+	"github.com/stretchr/testify/require"
 )
 
 func TestConnector(t *testing.T) {
-	dsnConnector, err := goHdbDriver.NewDSNConnector(goHdbDriver.TestDSN)
+	dsnConnector, err := hdb.NewDSNConnector(hdb.TestDSN)
 	if err != nil {
 		t.Fatal(err)
 	}
 	testConnector(t, dsnConnector)
 
-	basicAuthConnector := goHdbDriver.NewBasicAuthConnector(dsnConnector.Host(), dsnConnector.Username(), dsnConnector.Password())
+	basicAuthConnector := hdb.NewBasicAuthConnector(dsnConnector.Host(), dsnConnector.Username(), dsnConnector.Password())
 	testConnector(t, basicAuthConnector)
 }
 
@@ -54,12 +56,12 @@ func testConnector(t *testing.T, connector driver.Connector) {
 }
 
 func TestSessionVariables(t *testing.T) {
-	ctor, err := goHdbDriver.NewDSNConnector(goHdbDriver.TestDSN)
+	ctor, err := hdb.NewDSNConnector(hdb.TestDSN)
 	if err != nil {
 		t.Fatal(err)
 	}
 	// set session variables
-	sv := goHdbDriver.SessionVariables{"k1": "v1", "k2": "v2", "k3": "v3"}
+	sv := hdb.SessionVariables{"k1": "v1", "k2": "v2", "k3": "v3"}
 	if err := ctor.SetSessionVariables(sv); err != nil {
 		t.Fatal(err)
 	}
@@ -81,4 +83,40 @@ func TestSessionVariables(t *testing.T) {
 			t.Fatalf("session variable value for %s is %s - expected %s", k, val, v)
 		}
 	}
+}
+
+func TestConnectorProxy(t *testing.T) {
+	r := require.New(t)
+	ctor, err := hdb.NewDSNConnector(hdb.TestDSN)
+	r.NoError(err)
+	ctor.SetProxy(&proxy.Config{
+		Address: "127.0.0.1:1080",
+	})
+
+	db := sql.OpenDB(ctor)
+	r.NoError(db.Ping())
+	row := db.QueryRow("SELECT 1 AS VAL FROM DUMMY;")
+	var v int64
+	r.NoError(row.Scan(&v))
+	r.Equal(int64(1), v)
+	r.NoError(db.Close())
+}
+
+func TestConnectorProxyNoTimeout(t *testing.T) {
+	r := require.New(t)
+	ctor, err := hdb.NewDSNConnector(hdb.TestDSN)
+	r.NoError(err)
+	ctor.SetProxy(&proxy.Config{
+		Address: "127.0.0.1:1080",
+	})
+	r.NoError(ctor.SetTimeout(0))
+
+	db := sql.OpenDB(ctor)
+	r.NoError(db.Ping())
+	row := db.QueryRow("SELECT 1 AS VAL FROM DUMMY;")
+	var v int64
+	r.NoError(row.Scan(&v))
+	r.Equal(int64(1), v)
+	r.NoError(db.Close())
+
 }

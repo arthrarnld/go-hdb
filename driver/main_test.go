@@ -21,8 +21,11 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"testing"
+
+	socks "github.com/armon/go-socks5"
 )
 
 // globals
@@ -48,6 +51,15 @@ func TestMain(m *testing.M) {
 	if !flag.Parsed() {
 		flag.Parse()
 	}
+
+	// run SOCKS server
+	server, err := socks.New(&socks.Config{})
+	listener, err := net.Listen("tcp", "127.0.0.1:1080")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer listener.Close()
+	go server.Serve(listener)
 
 	// init driver
 	db, err := sql.Open(DriverName, TestDSN)
