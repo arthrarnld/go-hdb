@@ -26,6 +26,8 @@ import (
 	"net/url"
 	"strconv"
 	"sync"
+
+	"github.com/SAP/go-hdb/proxy"
 )
 
 /*
@@ -43,7 +45,7 @@ type Connector struct {
 	host                           string
 	username                       string
 	password                       string
-	proxy                          *url.URL
+	proxyConfig                    *proxy.Config
 	locale                         string
 	bufferSize, fetchSize, timeout int
 	tlsConfig                      *tls.Config
@@ -301,15 +303,14 @@ func (c *Connector) BasicAuthDSN() string {
 	}).String()
 }
 
-// Proxy returns the connector's proxy URL.
-func (c *Connector) Proxy() *url.URL {
-	return c.proxy
+// Proxy returns the proxy configuration stored in the connector
+func (c *Connector) Proxy() *proxy.Config {
+	return c.proxyConfig
 }
 
-// SetProxy sets c to connect over the SOCKS5 proxy server pointed to
-// by p.
-func (c *Connector) SetProxy(p *url.URL) {
-	c.proxy = p
+// SetProxy sets the connector's proxy configuration
+func (c *Connector) SetProxy(p *proxy.Config) {
+	c.proxyConfig = p
 }
 
 // Connect implements the database/sql/driver/Connector interface.

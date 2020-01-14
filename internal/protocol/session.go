@@ -25,16 +25,14 @@ import (
 	"log"
 	"math"
 	"net"
-	"net/url"
 	"os"
 	"sync"
 	"time"
 
-	"golang.org/x/net/proxy"
-
 	"github.com/SAP/go-hdb/internal/bufio"
 	"github.com/SAP/go-hdb/internal/unicode"
 	"github.com/SAP/go-hdb/internal/unicode/cesu8"
+	"github.com/SAP/go-hdb/proxy"
 
 	"github.com/SAP/go-hdb/driver/sqltrace"
 )
@@ -78,24 +76,17 @@ type sessionConn struct {
 	inTx     bool  // in transaction
 }
 
-func newSessionConn(ctx context.Context, addr string, timeoutSec int, tlsConfig *tls.Config, proxyURL *url.URL) (*sessionConn, error) {
-	var err error
+func newSessionConn(ctx context.Context, addr string, timeoutSec int, tlsConfig *tls.Config, proxyConfig *proxy.Config) (*sessionConn, error) {
 	var conn net.Conn
+	var err error
 	timeout := time.Duration(timeoutSec) * time.Second
-
-	if proxyURL == nil {
+	if proxyConfig == nil {
 		conn, err = (&net.Dialer{Timeout: timeout}).DialContext(ctx, "tcp", addr)
 	} else {
-		var d proxy.Dialer
-		var auth *proxy.Auth
-		if proxyURL.User != nil {
-			pw, _ := proxyURL.User.Password()
-			auth = &proxy.Auth{proxyURL.User.Username(), pw}
-		}
-		d, err = proxy.SOCKS5("tcp", proxyURL.Host, auth, proxy.Direct)
-		if err == nil {
-			conn, err = d.Dial("tcp", addr)
-		}
+		d := proxy.NewDialer(proxyConfig)
+		ctx, cancel := context.WithTimeout(ctx, timeout)
+		conn, err = d.DialContext(ctx, addr)
+		cancel()
 	}
 	if err != nil {
 		return nil, err
@@ -160,7 +151,7 @@ type sessionPrm interface {
 	FetchSize() int
 	Timeout() int
 	TLSConfig() *tls.Config
-	Proxy() *url.URL
+	Proxy() *proxy.Config
 }
 
 // Session represents a HDB session.
