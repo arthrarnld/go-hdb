@@ -2,6 +2,8 @@ go-hdb
 ======
 
 [![GoDoc](https://godoc.org/github.com/SAP/go-hdb/driver?status.png)](https://godoc.org/github.com/SAP/go-hdb/driver)
+[![Go Report Card](https://goreportcard.com/badge/github.com/SAP/go-hdb)](https://goreportcard.com/report/github.com/SAP/go-hdb)
+![](https://github.com/SAP/go-hdb/workflows/build/badge.svg)
 
 Go-hdb is a native Go (golang) HANA database driver for Go's sql package. It implements the SAP HANA SQL command network protocol:  
 <http://help.sap.com/hana/SAP_HANA_SQL_Command_Network_Protocol_Reference_en.pdf>
@@ -16,7 +18,7 @@ go get github.com/SAP/go-hdb/driver
 
 ## Building
 
-To build go-hdb you need to have a working Go environment with [version 1.11.5 or higher installed](https://golang.org/dl/).
+To build go-hdb you need to have a working Go environment with [version 1.14 or higher installed](https://golang.org/dl/).
 
 ## Documentation
 
@@ -43,11 +45,9 @@ go test -dsn hdb://user:password@host:port
 * Support of TLS TCP connections.
 * Support of little-endian (e.g. amd64) and big-endian architectures (e.g. s390x).
 * Support of [driver connector](https://golang.org/pkg/database/sql/driver/#Connector).
+* Support of [PBKDF2](https://tools.ietf.org/html/rfc2898) authentication as default and standard user / password as fallback.
 
 ## Dependencies
 
-* <http://golang.org/x/text/transform>
-
-## Todo
-
-* Additional Authentication Methods (actually only basic authentication is supported).
+* <https://godoc.org/golang.org/x/text/transform>
+* <https://godoc.org/golang.org/x/crypto/pbkdf2>

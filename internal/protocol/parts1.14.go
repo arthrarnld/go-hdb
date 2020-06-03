@@ -1,5 +1,7 @@
+// +build go1.14
+
 /*
-Copyright 2014 SAP SE
+Copyright 2020 SAP SE
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,16 +16,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+// Delete and re-itegrate into parts.go after go1.13 is out of maintenance.
+
 package protocol
 
-//go:generate stringer -type=QueryType
-
-// QueryType is the type definition for query types supported by this package.
-type QueryType byte
-
-// Query type constants.
-const (
-	QtNone QueryType = iota
-	QtSelect
-	QtProcedureCall
-)
+type partReadWriter interface {
+	partReader
+	partWriter
+}

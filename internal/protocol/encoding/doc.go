@@ -14,29 +14,5 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package driver
-
-import (
-	"database/sql"
-	"testing"
-)
-
-func TestConnection(t *testing.T) {
-	db, err := sql.Open(DriverName, TestDSN)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-
-	var dummy string
-	err = db.QueryRow("select * from dummy").Scan(&dummy)
-	switch {
-	case err == sql.ErrNoRows:
-		t.Fatal(err)
-	case err != nil:
-		t.Fatal(err)
-	}
-	if dummy != "X" {
-		t.Fatalf("dummy is %s - expected %s", dummy, "X")
-	}
-}
+// Package encoding implements ...
+package encoding

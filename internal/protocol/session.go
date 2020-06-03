@@ -17,47 +17,25 @@ limitations under the License.
 package protocol
 
 import (
+	"bufio"
 	"context"
 	"crypto/tls"
 	"database/sql/driver"
-	"flag"
 	"fmt"
-	"log"
-	"math"
+	"io"
 	"net"
-	"os"
 	"sync"
 	"time"
 
-	"github.com/SAP/go-hdb/internal/bufio"
+	"golang.org/x/text/transform"
+
 	"github.com/SAP/go-hdb/internal/unicode"
 	"github.com/SAP/go-hdb/internal/unicode/cesu8"
 	"github.com/SAP/go-hdb/proxy"
-
-	"github.com/SAP/go-hdb/driver/sqltrace"
-)
-
-const (
-	mnSCRAMSHA256 = "SCRAMSHA256"
-	mnGSS         = "GSS"
-	mnSAML        = "SAML"
-)
-
-var trace bool
-
-func init() {
-	flag.BoolVar(&trace, "hdb.protocol.trace", false, "enabling hdb protocol trace")
-}
-
-var (
-	outLogger = log.New(os.Stdout, "hdb.protocol ", log.Ldate|log.Ltime|log.Lshortfile)
-	errLogger = log.New(os.Stderr, "hdb.protocol ", log.Ldate|log.Ltime|log.Lshortfile)
 )
 
 //padding
-const (
-	padding = 8
-)
+const padding = 8
 
 func padBytes(size int) int {
 	if r := size % padding; r != 0 {
@@ -66,20 +44,74 @@ func padBytes(size int) int {
 	return 0
 }
 
-// SessionConn wraps the database tcp connection. It sets timeouts and handles driver ErrBadConn behavior.
-type sessionConn struct {
-	addr     string
-	timeout  time.Duration
-	conn     net.Conn
-	isBad    bool  // bad connection
-	badError error // error cause for session bad state
-	inTx     bool  // in transaction
+// session handling
+const (
+	sesRecording = "rec"
+	sesReplay    = "rpl"
+)
+
+type sessionStatus interface {
+	isBad() bool
 }
 
-func newSessionConn(ctx context.Context, addr string, timeoutSec int, tlsConfig *tls.Config, proxyConfig *proxy.Config) (*sessionConn, error) {
-	var conn net.Conn
-	var err error
+type sessionConn interface {
+	io.ReadWriteCloser
+	sessionStatus
+}
+
+func newSessionConn(ctx context.Context, addr string, timeoutSec int, tlsConfig *tls.Config, proxyConfig *proxy.Config) (sessionConn, error) {
+	// session recording
+	if wr, ok := ctx.Value(sesRecording).(io.Writer); ok {
+		conn, err := newDbConn(ctx, addr, timeoutSec, tlsConfig, proxyConfig)
+		if err != nil {
+			return nil, err
+		}
+		return proxyConn{
+			Reader:        io.TeeReader(conn, wr), // teereader: write database replies to writer
+			Writer:        conn,
+			Closer:        conn,
+			sessionStatus: conn,
+		}, nil
+	}
+	// session replay
+	if rd, ok := ctx.Value(sesReplay).(io.Reader); ok {
+		nwc := nullWriterCloser{}
+		return proxyConn{
+			Reader:        rd,
+			Writer:        nwc,
+			Closer:        nwc,
+			sessionStatus: nwc,
+		}, nil
+	}
+	return newDbConn(ctx, addr, timeoutSec, tlsConfig, proxyConfig)
+}
+
+type nullWriterCloser struct{}
+
+func (n nullWriterCloser) Write(p []byte) (int, error) { return len(p), nil }
+func (n nullWriterCloser) Close() error                { return nil }
+func (n nullWriterCloser) isBad() bool                 { return false }
+
+// proxy connection
+type proxyConn struct {
+	io.Reader
+	io.Writer
+	io.Closer
+	sessionStatus
+}
+
+// dbConn wraps the database tcp connection. It sets timeouts and handles driver ErrBadConn behavior.
+type dbConn struct {
+	addr      string
+	timeout   time.Duration
+	conn      net.Conn
+	lastError error // error bad connection
+}
+
+func newDbConn(ctx context.Context, addr string, timeoutSec int, tlsConfig *tls.Config, proxyConfig *proxy.Config) (*dbConn, error) {
 	timeout := time.Duration(timeoutSec) * time.Second
+	var err error
+	var conn net.Conn
 	if proxyConfig == nil {
 		conn, err = (&net.Dialer{Timeout: timeout}).DialContext(ctx, "tcp", addr)
 	} else {
@@ -101,15 +133,17 @@ func newSessionConn(ctx context.Context, addr string, timeoutSec int, tlsConfig 
 		conn = tls.Client(conn, tlsConfig)
 	}
 
-	return &sessionConn{addr: addr, timeout: timeout, conn: conn}, nil
+	return &dbConn{addr: addr, timeout: timeout, conn: conn}, nil
 }
 
-func (c *sessionConn) close() error {
+func (c *dbConn) isBad() bool { return c.lastError != nil }
+
+func (c *dbConn) Close() error {
 	return c.conn.Close()
 }
 
 // Read implements the io.Reader interface.
-func (c *sessionConn) Read(b []byte) (int, error) {
+func (c *dbConn) Read(b []byte) (int, error) {
 	//set timeout
 	if c.timeout > 0 {
 		if err := c.conn.SetReadDeadline(time.Now().Add(c.timeout)); err != nil {
@@ -118,16 +152,15 @@ func (c *sessionConn) Read(b []byte) (int, error) {
 	}
 	n, err := c.conn.Read(b)
 	if err != nil {
-		errLogger.Printf("Connection read error local address %s remote address %s: %s", c.conn.LocalAddr(), c.conn.RemoteAddr(), err)
-		c.isBad = true
-		c.badError = err
+		plog.Printf("Connection read error local address %s remote address %s: %s", c.conn.LocalAddr(), c.conn.RemoteAddr(), err)
+		c.lastError = err
 		return n, driver.ErrBadConn
 	}
 	return n, nil
 }
 
 // Write implements the io.Writer interface.
-func (c *sessionConn) Write(b []byte) (int, error) {
+func (c *dbConn) Write(b []byte) (int, error) {
 	//set timeout
 	if c.timeout > 0 {
 		if err := c.conn.SetWriteDeadline(time.Now().Add(c.timeout)); err != nil {
@@ -136,284 +169,242 @@ func (c *sessionConn) Write(b []byte) (int, error) {
 	}
 	n, err := c.conn.Write(b)
 	if err != nil {
-		errLogger.Printf("Connection write error local address %s remote address %s: %s", c.conn.LocalAddr(), c.conn.RemoteAddr(), err)
-		c.isBad = true
-		c.badError = err
+		plog.Printf("Connection write error local address %s remote address %s: %s", c.conn.LocalAddr(), c.conn.RemoteAddr(), err)
+		c.lastError = err
 		return n, driver.ErrBadConn
 	}
 	return n, nil
 }
 
-type beforeRead func(p replyPart)
-
-// session parameter
-type sessionPrm interface {
+// SessionConfig represents the session relevant driver connector options.
+type SessionConfig interface {
 	Host() string
 	Username() string
 	Password() string
 	Locale() string
+	BufferSize() int
 	FetchSize() int
+	BulkSize() int
+	LobChunkSize() int32
 	Timeout() int
+	Dfv() int
 	TLSConfig() *tls.Config
 	Proxy() *proxy.Config
+	Legacy() bool
 }
+
+const dfvLevel1 = 1
+
+const defaultSessionID = -1
 
 // Session represents a HDB session.
 type Session struct {
-	prm sessionPrm
+	cfg SessionConfig
 
-	conn *sessionConn
+	sessionID int64
+
+	conn sessionConn
 	rd   *bufio.Reader
 	wr   *bufio.Writer
 
-	// reuse header
-	mh *messageHeader
-	sh *segmentHeader
-	ph *partHeader
-
-	//reuse request / reply parts
-	scramsha256InitialRequest *scramsha256InitialRequest
-	scramsha256InitialReply   *scramsha256InitialReply
-	scramsha256FinalRequest   *scramsha256FinalRequest
-	scramsha256FinalReply     *scramsha256FinalReply
-	topologyInformation       *topologyInformation
-	connectOptions            *connectOptions
-	rowsAffected              *rowsAffected
-	statementID               *statementID
-	resultMetadata            *resultMetadata
-	resultsetID               *resultsetID
-	resultset                 *resultset
-	parameterMetadata         *parameterMetadata
-	outputParameters          *outputParameters
-	writeLobRequest           *writeLobRequest
-	readLobRequest            *readLobRequest
-	writeLobReply             *writeLobReply
-	readLobReply              *readLobReply
-
-	//standard replies
-	stmtCtx   *statementContext
-	txFlags   *transactionFlags
-	lastError *hdbErrors
+	pr *protocolReader
+	pw *protocolWriter
 
 	//serialize write request - read reply
 	//supports calling session methods in go routines (driver methods with context cancellation)
 	mu sync.Mutex
+
+	inTx bool // in transaction
+
 }
 
 // NewSession creates a new database session.
-func NewSession(ctx context.Context, prm sessionPrm) (*Session, error) {
-
-	if trace {
-		outLogger.Printf("%s", prm)
-	}
-
-	conn, err := newSessionConn(ctx, prm.Host(), prm.Timeout(), prm.TLSConfig(), prm.Proxy())
+func NewSession(ctx context.Context, cfg SessionConfig) (*Session, error) {
+	conn, err := newSessionConn(ctx, cfg.Host(), cfg.Timeout(), cfg.TLSConfig(), cfg.Proxy())
 	if err != nil {
 		return nil, err
 	}
 
-	rd := bufio.NewReader(conn)
-	wr := bufio.NewWriter(conn)
+	var bufRd *bufio.Reader
+	var bufWr *bufio.Writer
 
-	s := &Session{
-		prm:                       prm,
-		conn:                      conn,
-		rd:                        rd,
-		wr:                        wr,
-		mh:                        new(messageHeader),
-		sh:                        new(segmentHeader),
-		ph:                        new(partHeader),
-		scramsha256InitialRequest: new(scramsha256InitialRequest),
-		scramsha256InitialReply:   new(scramsha256InitialReply),
-		scramsha256FinalRequest:   new(scramsha256FinalRequest),
-		scramsha256FinalReply:     new(scramsha256FinalReply),
-		topologyInformation:       newTopologyInformation(),
-		connectOptions:            newConnectOptions(),
-		rowsAffected:              new(rowsAffected),
-		statementID:               new(statementID),
-		resultMetadata:            new(resultMetadata),
-		resultsetID:               new(resultsetID),
-		resultset:                 new(resultset),
-		parameterMetadata:         new(parameterMetadata),
-		outputParameters:          new(outputParameters),
-		writeLobRequest:           new(writeLobRequest),
-		readLobRequest:            new(readLobRequest),
-		writeLobReply:             new(writeLobReply),
-		readLobReply:              new(readLobReply),
-		stmtCtx:                   newStatementContext(),
-		txFlags:                   newTransactionFlags(),
-		lastError:                 new(hdbErrors),
+	bufferSize := cfg.BufferSize()
+	if bufferSize > 0 {
+		bufRd = bufio.NewReaderSize(conn, bufferSize)
+		bufWr = bufio.NewWriterSize(conn, bufferSize)
+	} else {
+		bufRd = bufio.NewReader(conn)
+		bufWr = bufio.NewWriter(conn)
 	}
 
-	if err = s.init(); err != nil {
+	pw := newProtocolWriter(bufWr) // write upstream
+	if err := pw.writeProlog(); err != nil {
 		return nil, err
 	}
 
-	return s, nil
+	pr := newProtocolReader(false, bufRd) // read downstream
+	if err := pr.readProlog(); err != nil {
+		return nil, err
+	}
+
+	s := &Session{
+		cfg:       cfg,
+		sessionID: defaultSessionID,
+		conn:      conn,
+		rd:        bufRd,
+		wr:        bufWr,
+		pr:        pr,
+		pw:        pw,
+	}
+	return s, s.authenticate()
+}
+
+// Reset resets the session.
+func (s *Session) Reset() {
+	QrsCache.cleanup(s)
 }
 
 // Close closes the session.
 func (s *Session) Close() error {
-	return s.conn.close()
-}
-
-func (s *Session) sessionID() int64 {
-	return s.mh.sessionID
+	QrsCache.cleanup(s)
+	return s.conn.Close()
 }
 
 // InTx indicates, if the session is in transaction mode.
 func (s *Session) InTx() bool {
-	return s.conn.inTx
+	return s.inTx
 }
 
 // SetInTx sets session in transaction mode.
 func (s *Session) SetInTx(v bool) {
-	s.conn.inTx = v
+	s.inTx = v
 }
 
 // IsBad indicates, that the session is in bad state.
 func (s *Session) IsBad() bool {
-	return s.conn.isBad
+	return s.conn.isBad()
 }
 
-// BadErr returns the error, that caused the bad session state.
-func (s *Session) BadErr() error {
-	return s.conn.badError
+// MaxBulkNum returns the maximal number of bulk calls before auto flush.
+func (s *Session) MaxBulkNum() int {
+	maxBulkNum := s.cfg.BulkSize()
+	if maxBulkNum > maxPartNum {
+		return maxPartNum // max number of parameters (see parameter header)
+	}
+	return maxBulkNum
 }
 
-func (s *Session) init() error {
-
-	if err := s.initRequest(); err != nil {
+func (s *Session) authenticate() error {
+	authStepper := newAuth(s.cfg.Username(), s.cfg.Password())
+	if err := s.authenticateMethod(authStepper); err != nil {
 		return err
 	}
-
-	// TODO: detect authentication method
-	// - actually only basic authetication supported
-
-	authentication := mnSCRAMSHA256
-
-	switch authentication {
-	default:
-		return fmt.Errorf("invalid authentication %s", authentication)
-
-	case mnSCRAMSHA256:
-		if err := s.authenticateScramsha256(); err != nil {
-			return err
-		}
-	case mnGSS:
-		panic("not implemented error")
-	case mnSAML:
-		panic("not implemented error")
+	if s.sessionID <= 0 {
+		return fmt.Errorf("invalid session id %d", s.sessionID)
 	}
-
-	id := s.sessionID()
-	if id <= 0 {
-		return fmt.Errorf("invalid session id %d", id)
-	}
-
-	if trace {
-		outLogger.Printf("sessionId %d", id)
-	}
-
 	return nil
 }
 
-func (s *Session) authenticateScramsha256() error {
-	tr := unicode.Utf8ToCesu8Transformer
-	tr.Reset()
-
-	username := make([]byte, cesu8.StringSize(s.prm.Username()))
-	if _, _, err := tr.Transform(username, []byte(s.prm.Username()), true); err != nil {
-		return err // should never happen
-	}
-
-	password := make([]byte, cesu8.StringSize(s.prm.Password()))
-	if _, _, err := tr.Transform(password, []byte(s.prm.Password()), true); err != nil {
-		return err //should never happen
-	}
-
-	clientChallenge := clientChallenge()
-
-	//initial request
-	s.scramsha256InitialRequest.username = username
-	s.scramsha256InitialRequest.clientChallenge = clientChallenge
-
-	if err := s.writeRequest(mtAuthenticate, false, s.scramsha256InitialRequest); err != nil {
-		return err
-	}
-
-	if err := s.readReply(nil); err != nil {
-		return err
-	}
-
-	//final request
-	s.scramsha256FinalRequest.username = username
-	s.scramsha256FinalRequest.clientProof = clientProof(s.scramsha256InitialReply.salt, s.scramsha256InitialReply.serverChallenge, clientChallenge, password)
-
-	s.scramsha256InitialReply = nil // !!! next time readReply uses FinalReply
-
-	id := newClientID()
-
-	co := newConnectOptions()
-	co.set(coDistributionProtocolVersion, booleanType(false))
-	co.set(coSelectForUpdateSupported, booleanType(false))
-	co.set(coSplitBatchCommands, booleanType(true))
-	// cannot use due to HDB protocol error with secondtime datatype
-	//co.set(coDataFormatVersion2, dfvSPS06)
-	co.set(coDataFormatVersion2, dfvBaseline)
-	co.set(coCompleteArrayExecution, booleanType(true))
-	if s.prm.Locale() != "" {
-		co.set(coClientLocale, stringType(s.prm.Locale()))
+func (s *Session) connectOptions() connectOptions {
+	co := connectOptions{}
+	co.set(coDistributionProtocolVersion, optBooleanType(false))
+	co.set(coSelectForUpdateSupported, optBooleanType(false))
+	co.set(coSplitBatchCommands, optBooleanType(true))
+	co.set(coDataFormatVersion2, optIntType(s.cfg.Dfv()))
+	co.set(coCompleteArrayExecution, optBooleanType(true))
+	if s.cfg.Locale() != "" {
+		co.set(coClientLocale, optStringType(s.cfg.Locale()))
 	}
 	co.set(coClientDistributionMode, cdmOff)
-	// setting this option has no effect
-	//co.set(coImplicitLobStreaming, booleanType(true))
+	// co.set(coImplicitLobStreaming, optBooleanType(true))
+	return co
+}
 
-	if err := s.writeRequest(mtConnect, false, s.scramsha256FinalRequest, id, co); err != nil {
+func (s *Session) authenticateMethod(stepper authStepper) error {
+	var auth partReadWriter
+	var err error
+
+	if auth, err = stepper.next(); err != nil {
+		return err
+	}
+	if err := s.pw.write(s.sessionID, mtAuthenticate, false, auth); err != nil {
 		return err
 	}
 
-	if err := s.readReply(nil); err != nil {
+	if auth, err = stepper.next(); err != nil {
+		return err
+	}
+	if err := s.pr.iterateParts(func(ph *partHeader) {
+		if ph.partKind == pkAuthentication {
+			s.pr.read(auth)
+		}
+	}); err != nil {
 		return err
 	}
 
+	if auth, err = stepper.next(); err != nil {
+		return err
+	}
+	id := newClientID()
+	co := s.connectOptions()
+	if err := s.pw.write(s.sessionID, mtConnect, false, auth, id, co); err != nil {
+		return err
+	}
+
+	if auth, err = stepper.next(); err != nil {
+		return err
+	}
+	if err := s.pr.iterateParts(func(ph *partHeader) {
+		switch ph.partKind {
+		case pkAuthentication:
+			s.pr.read(auth)
+		case pkConnectOptions:
+			s.pr.read(&co)
+			// set data format version
+			// TODO generalize for sniffer
+			s.pr.setDfv(int(co[coDataFormatVersion2].(optIntType)))
+		}
+	}); err != nil {
+		return err
+	}
+	s.sessionID = s.pr.sessionID()
 	return nil
 }
 
 // QueryDirect executes a query without query parameters.
-func (s *Session) QueryDirect(query string) (uint64, *ResultFieldSet, *FieldValues, PartAttributes, error) {
+func (s *Session) QueryDirect(query string) (driver.Rows, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if err := s.writeRequest(mtExecuteDirect, false, command(query)); err != nil {
-		return 0, nil, nil, nil, err
+	// allow e.g inserts as query -> handle commit like in ExecDirect
+	if err := s.pw.write(s.sessionID, mtExecuteDirect, !s.inTx, command(query)); err != nil {
+		return nil, err
 	}
 
-	var id uint64
-	var resultFieldSet *ResultFieldSet
-	fieldValues := newFieldValues()
+	qr := &queryResult{}
+	meta := &resultMetadata{}
+	resSet := &resultset{}
 
-	f := func(p replyPart) {
-
-		switch p := p.(type) {
-
-		case *resultsetID:
-			p.id = &id
-		case *resultMetadata:
-			resultFieldSet = newResultFieldSet(p.numArg)
-			p.resultFieldSet = resultFieldSet
-		case *resultset:
-			p.s = s
-			p.resultFieldSet = resultFieldSet
-			p.fieldValues = fieldValues
+	if err := s.pr.iterateParts(func(ph *partHeader) {
+		switch ph.partKind {
+		case pkResultMetadata:
+			s.pr.read(meta)
+			qr.fields = meta.resultFields
+		case pkResultsetID:
+			s.pr.read((*resultsetID)(&qr._rsID))
+		case pkResultset:
+			resSet.resultFields = qr.fields
+			s.pr.read(resSet)
+			qr.fieldValues = resSet.fieldValues
+			qr.attributes = ph.partAttributes
 		}
+	}); err != nil {
+		return nil, err
 	}
-
-	if err := s.readReply(f); err != nil {
-		return 0, nil, nil, nil, err
+	if qr._rsID == 0 { // non select query
+		return noResult, nil
 	}
-
-	return id, resultFieldSet, fieldValues, s.ph.partAttributes, nil
+	return newQueryResultSet(s, qr), nil
 }
 
 // ExecDirect executes a sql statement without statement parameters.
@@ -421,245 +412,359 @@ func (s *Session) ExecDirect(query string) (driver.Result, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if err := s.writeRequest(mtExecuteDirect, !s.conn.inTx, command(query)); err != nil {
+	if err := s.pw.write(s.sessionID, mtExecuteDirect, !s.inTx, command(query)); err != nil {
 		return nil, err
 	}
 
-	if err := s.readReply(nil); err != nil {
+	rows := &rowsAffected{}
+	var numRow int64
+	if err := s.pr.iterateParts(func(ph *partHeader) {
+		if ph.partKind == pkRowsAffected {
+			s.pr.read(rows)
+			numRow = rows.total()
+		}
+	}); err != nil {
 		return nil, err
 	}
-
-	if s.sh.functionCode == fcDDL {
+	if s.pr.functionCode() == fcDDL {
 		return driver.ResultNoRows, nil
 	}
-	return driver.RowsAffected(s.rowsAffected.total()), nil
+	return driver.RowsAffected(numRow), nil
 }
 
 // Prepare prepares a sql statement.
-func (s *Session) Prepare(query string) (QueryType, uint64, *ParameterFieldSet, *ResultFieldSet, error) {
+func (s *Session) Prepare(query string) (*PrepareResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if err := s.writeRequest(mtPrepare, false, command(query)); err != nil {
-		return QtNone, 0, nil, nil, err
+	if err := s.pw.write(s.sessionID, mtPrepare, false, command(query)); err != nil {
+		return nil, err
 	}
 
-	var id uint64
-	var prmFieldSet *ParameterFieldSet
-	var resultFieldSet *ResultFieldSet
+	pr := &PrepareResult{}
+	resMeta := &resultMetadata{}
+	prmMeta := &parameterMetadata{}
 
-	f := func(p replyPart) {
-
-		switch p := p.(type) {
-
-		case *statementID:
-			p.id = &id
-		case *parameterMetadata:
-			prmFieldSet = newParameterFieldSet(p.numArg)
-			p.prmFieldSet = prmFieldSet
-		case *resultMetadata:
-			resultFieldSet = newResultFieldSet(p.numArg)
-			p.resultFieldSet = resultFieldSet
+	if err := s.pr.iterateParts(func(ph *partHeader) {
+		switch ph.partKind {
+		case pkStatementID:
+			s.pr.read((*statementID)(&pr.stmtID))
+		case pkResultMetadata:
+			s.pr.read(resMeta)
+			pr.resultFields = resMeta.resultFields
+		case pkParameterMetadata:
+			s.pr.read(prmMeta)
+			pr.prmFields = prmMeta.parameterFields
 		}
+	}); err != nil {
+		return nil, err
 	}
-
-	if err := s.readReply(f); err != nil {
-		return QtNone, 0, nil, nil, err
-	}
-
-	return s.sh.functionCode.queryType(), id, prmFieldSet, resultFieldSet, nil
+	pr.fc = s.pr.functionCode()
+	return pr, nil
 }
 
 // Exec executes a sql statement.
-func (s *Session) Exec(id uint64, prmFieldSet *ParameterFieldSet, args []driver.NamedValue) (driver.Result, error) {
+func (s *Session) Exec(pr *PrepareResult, args []driver.NamedValue) (driver.Result, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.statementID.id = &id
-	if err := s.writeRequest(mtExecute, !s.conn.inTx, s.statementID, newInputParameters(prmFieldSet.inputFields(), args)); err != nil {
+	if err := s.pw.write(s.sessionID, mtExecute, !s.inTx, statementID(pr.stmtID), newInputParameters(pr.prmFields, args)); err != nil {
 		return nil, err
 	}
 
-	if err := s.readReply(nil); err != nil {
+	rows := &rowsAffected{}
+	var ids []locatorID
+	lobReply := &writeLobReply{}
+	var numRow int64
+
+	if err := s.pr.iterateParts(func(ph *partHeader) {
+		switch ph.partKind {
+		case pkRowsAffected:
+			s.pr.read(rows)
+			numRow = rows.total()
+		case pkWriteLobReply:
+			s.pr.read(lobReply)
+			ids = lobReply.ids
+		}
+	}); err != nil {
+		return nil, err
+	}
+	fc := s.pr.functionCode()
+
+	if len(ids) != 0 {
+		/*
+			writeLobParameters:
+			- chunkReaders
+			- nil (no callResult, exec does not have output parameters)
+		*/
+		if err := s.encodeLobs(nil, ids, pr.prmFields, args); err != nil {
+			return nil, err
+		}
+	}
+
+	if fc == fcDDL {
+		return driver.ResultNoRows, nil
+	}
+	return driver.RowsAffected(numRow), nil
+}
+
+// QueryCall executes a stored procecure (by Query).
+func (s *Session) QueryCall(pr *PrepareResult, args []driver.NamedValue) (driver.Rows, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	/*
+		only in args
+		invariant: #inPrmFields == #args
+	*/
+	var inPrmFields, outPrmFields []*parameterField
+	for _, f := range pr.prmFields {
+		if f.In() {
+			inPrmFields = append(inPrmFields, f)
+		}
+		if f.Out() {
+			outPrmFields = append(outPrmFields, f)
+		}
+	}
+
+	if err := s.pw.write(s.sessionID, mtExecute, false, statementID(pr.stmtID), newInputParameters(inPrmFields, args)); err != nil {
 		return nil, err
 	}
 
-	var result driver.Result
-	if s.sh.functionCode == fcDDL {
-		result = driver.ResultNoRows
+	/*
+		call without lob input parameters:
+		--> callResult output parameter values are set after read call
+		call with lob input parameters:
+		--> callResult output parameter values are set after last lob input write
+	*/
+
+	cr, ids, err := s.readCall(outPrmFields)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(ids) != 0 {
+		/*
+			writeLobParameters:
+			- chunkReaders
+			- cr (callResult output parameters are set after all lob input parameters are written)
+		*/
+		if err := s.encodeLobs(cr, ids, inPrmFields, args); err != nil {
+			return nil, err
+		}
+	}
+
+	// legacy mode?
+	if s.cfg.Legacy() {
+		cr.appendTableRefFields() // TODO review
+		for _, qr := range cr.qrs {
+			// add to cache
+			QrsCache.set(qr._rsID, newQueryResultSet(s, qr))
+		}
 	} else {
-		result = driver.RowsAffected(s.rowsAffected.total())
+		cr.appendTableRowsFields(s)
+	}
+	return newQueryResultSet(s, cr), nil
+}
+
+// ExecCall executes a stored procecure (by Exec).
+func (s *Session) ExecCall(pr *PrepareResult, args []driver.NamedValue) (driver.Result, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	/*
+		in,- and output args
+		invariant: #prmFields == #args
+	*/
+	var inPrmFields, outPrmFields []*parameterField
+	var inArgs, outArgs []driver.NamedValue
+	for i, f := range pr.prmFields {
+		if f.In() {
+			inPrmFields = append(inPrmFields, f)
+			inArgs = append(inArgs, args[i])
+		}
+		if f.Out() {
+			outPrmFields = append(outPrmFields, f)
+			outArgs = append(outArgs, args[i])
+		}
 	}
 
-	if err := s.writeLobStream(prmFieldSet, nil, args); err != nil {
+	if err := s.pw.write(s.sessionID, mtExecute, false, statementID(pr.stmtID), newInputParameters(inPrmFields, inArgs)); err != nil {
 		return nil, err
 	}
 
-	return result, nil
+	/*
+		call without lob input parameters:
+		--> callResult output parameter values are set after read call
+		call with lob input parameters:
+		--> callResult output parameter values are set after last lob input write
+	*/
+
+	cr, ids, err := s.readCall(outPrmFields)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(ids) != 0 {
+		/*
+			writeLobParameters:
+			- chunkReaders
+			- cr (callResult output parameters are set after all lob input parameters are written)
+		*/
+		if err := s.encodeLobs(cr, ids, inPrmFields, inArgs); err != nil {
+			return nil, err
+		}
+	}
+
+	// TODO release v1.0.0 - assign output parameters
+	return nil, fmt.Errorf("not implemented yet")
+	//return driver.ResultNoRows, nil
+}
+
+func (s *Session) readCall(outputFields []*parameterField) (*callResult, []locatorID, error) {
+	cr := &callResult{outputFields: outputFields}
+
+	//var qrs []*QueryResult
+	var qr *queryResult
+	var ids []locatorID
+	outPrms := &outputParameters{}
+	meta := &resultMetadata{}
+	resSet := &resultset{}
+	lobReply := &writeLobReply{}
+
+	if err := s.pr.iterateParts(func(ph *partHeader) {
+		switch ph.partKind {
+		case pkOutputParameters:
+			outPrms.outputFields = cr.outputFields
+			s.pr.read(outPrms)
+			cr.fieldValues = outPrms.fieldValues
+		case pkResultMetadata:
+			/*
+				procedure call with table parameters does return metadata for each table
+				sequence: metadata, resultsetID, resultset
+				but:
+				- resultset might not be provided for all tables
+				- so, 'additional' query result is detected by new metadata part
+			*/
+			qr = &queryResult{}
+			cr.qrs = append(cr.qrs, qr)
+			s.pr.read(meta)
+			qr.fields = meta.resultFields
+		case pkResultset:
+			resSet.resultFields = qr.fields
+			s.pr.read(resSet)
+			qr.fieldValues = resSet.fieldValues
+			qr.attributes = ph.partAttributes
+		case pkResultsetID:
+			s.pr.read((*resultsetID)(&qr._rsID))
+		case pkWriteLobReply:
+			s.pr.read(lobReply)
+			ids = lobReply.ids
+		}
+	}); err != nil {
+		return nil, nil, err
+	}
+
+	// init fieldValues
+	if cr.fieldValues == nil {
+		cr.fieldValues = newFieldValues(0)
+	}
+	for _, qr := range cr.qrs {
+		if qr.fieldValues == nil {
+			qr.fieldValues = newFieldValues(0)
+		}
+	}
+	return cr, ids, nil
+}
+
+// Query executes a query.
+func (s *Session) Query(pr *PrepareResult, args []driver.NamedValue) (driver.Rows, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// allow e.g inserts as query -> handle commit like in exec
+	if err := s.pw.write(s.sessionID, mtExecute, !s.inTx, statementID(pr.stmtID), newInputParameters(pr.prmFields, args)); err != nil {
+		return nil, err
+	}
+
+	qr := &queryResult{fields: pr.resultFields}
+	resSet := &resultset{}
+
+	if err := s.pr.iterateParts(func(ph *partHeader) {
+		switch ph.partKind {
+		case pkResultsetID:
+			s.pr.read((*resultsetID)(&qr._rsID))
+		case pkResultset:
+			resSet.resultFields = qr.fields
+			s.pr.read(resSet)
+			qr.fieldValues = resSet.fieldValues
+			qr.attributes = ph.partAttributes
+		}
+	}); err != nil {
+		return nil, err
+	}
+	if qr._rsID == 0 { // non select query
+		return noResult, nil
+	}
+	return newQueryResultSet(s, qr), nil
+}
+
+// FetchNext fetches next chunk in query result set.
+func (s *Session) fetchNext(rr rowsResult) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	qr, err := rr.queryResult()
+	if err != nil {
+		return err
+	}
+	if err := s.pw.write(s.sessionID, mtFetchNext, false, resultsetID(qr._rsID), fetchsize(s.cfg.FetchSize())); err != nil {
+		return err
+	}
+
+	resSet := &resultset{}
+
+	return s.pr.iterateParts(func(ph *partHeader) {
+		if ph.partKind == pkResultset {
+			resSet.resultFields = qr.fields
+			s.pr.read(resSet)
+			qr.fieldValues = resSet.fieldValues
+			qr.attributes = ph.partAttributes
+		}
+	})
 }
 
 // DropStatementID releases the hdb statement handle.
 func (s *Session) DropStatementID(id uint64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
-	s.statementID.id = &id
-	if err := s.writeRequest(mtDropStatementID, false, s.statementID); err != nil {
+	if err := s.pw.write(s.sessionID, mtDropStatementID, false, statementID(id)); err != nil {
 		return err
 	}
-
-	if err := s.readReply(nil); err != nil {
-		return err
-	}
-
-	return nil
-}
-
-// Call executes a stored procedure.
-func (s *Session) Call(id uint64, prmFieldSet *ParameterFieldSet, args []driver.NamedValue) (*FieldValues, []*TableResult, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	s.statementID.id = &id
-	if err := s.writeRequest(mtExecute, false, s.statementID, newInputParameters(prmFieldSet.inputFields(), args)); err != nil {
-		return nil, nil, err
-	}
-
-	prmFieldValues := newFieldValues()
-	var tableResults []*TableResult
-	var tableResult *TableResult
-
-	f := func(p replyPart) {
-
-		switch p := p.(type) {
-
-		case *outputParameters:
-			p.s = s
-			p.outputFields = prmFieldSet.outputFields()
-			p.fieldValues = prmFieldValues
-
-		// table output parameters: meta, id, result (only first param?)
-		case *resultMetadata:
-			tableResult = newTableResult(s, p.numArg)
-			tableResults = append(tableResults, tableResult)
-			p.resultFieldSet = tableResult.resultFieldSet
-		case *resultsetID:
-			p.id = &(tableResult.id)
-		case *resultset:
-			p.s = s
-			tableResult.attrs = s.ph.partAttributes
-			p.resultFieldSet = tableResult.resultFieldSet
-			p.fieldValues = tableResult.fieldValues
-		}
-	}
-
-	if err := s.readReply(f); err != nil {
-		return nil, nil, err
-	}
-
-	if err := s.writeLobStream(prmFieldSet, prmFieldValues, args); err != nil {
-		return nil, nil, err
-	}
-
-	return prmFieldValues, tableResults, nil
-}
-
-// Query executes a query.
-func (s *Session) Query(stmtID uint64, prmFieldSet *ParameterFieldSet, resultFieldSet *ResultFieldSet, args []driver.NamedValue) (uint64, *FieldValues, PartAttributes, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	s.statementID.id = &stmtID
-	if err := s.writeRequest(mtExecute, false, s.statementID, newInputParameters(prmFieldSet.inputFields(), args)); err != nil {
-		return 0, nil, nil, err
-	}
-
-	var rsetID uint64
-	fieldValues := newFieldValues()
-
-	f := func(p replyPart) {
-
-		switch p := p.(type) {
-
-		case *resultsetID:
-			p.id = &rsetID
-		case *resultset:
-			p.s = s
-			p.resultFieldSet = resultFieldSet
-			p.fieldValues = fieldValues
-		}
-	}
-
-	if err := s.readReply(f); err != nil {
-		return 0, nil, nil, err
-	}
-
-	return rsetID, fieldValues, s.ph.partAttributes, nil
-}
-
-// FetchNext fetches next chunk in query result set.
-func (s *Session) FetchNext(id uint64, resultFieldSet *ResultFieldSet, fieldValues *FieldValues) (PartAttributes, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	s.resultsetID.id = &id
-	if err := s.writeRequest(mtFetchNext, false, s.resultsetID, fetchsize(s.prm.FetchSize())); err != nil {
-		return nil, err
-	}
-
-	f := func(p replyPart) {
-
-		switch p := p.(type) {
-
-		case *resultset:
-			p.s = s
-			p.resultFieldSet = resultFieldSet
-			p.fieldValues = fieldValues
-		}
-	}
-
-	if err := s.readReply(f); err != nil {
-		return nil, err
-	}
-
-	return s.ph.partAttributes, nil
+	return s.pr.readSkip()
 }
 
 // CloseResultsetID releases the hdb resultset handle.
 func (s *Session) CloseResultsetID(id uint64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
-	s.resultsetID.id = &id
-	if err := s.writeRequest(mtCloseResultset, false, s.resultsetID); err != nil {
+	if err := s.pw.write(s.sessionID, mtCloseResultset, false, resultsetID(id)); err != nil {
 		return err
 	}
-
-	if err := s.readReply(nil); err != nil {
-		return err
-	}
-
-	return nil
+	return s.pr.readSkip()
 }
 
 // Commit executes a database commit.
 func (s *Session) Commit() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
-	if err := s.writeRequest(mtCommit, false); err != nil {
+	if err := s.pw.write(s.sessionID, mtCommit, false); err != nil {
 		return err
 	}
-
-	if err := s.readReply(nil); err != nil {
+	if err := s.pr.readSkip(); err != nil {
 		return err
 	}
-
-	if trace {
-		outLogger.Printf("transaction flags: %s", s.txFlags)
-	}
-
-	s.conn.inTx = false
+	s.inTx = false
 	return nil
 }
 
@@ -667,327 +772,206 @@ func (s *Session) Commit() error {
 func (s *Session) Rollback() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
-	if err := s.writeRequest(mtRollback, false); err != nil {
+	if err := s.pw.write(s.sessionID, mtRollback, false); err != nil {
 		return err
 	}
-
-	if err := s.readReply(nil); err != nil {
+	if err := s.pr.readSkip(); err != nil {
 		return err
 	}
-
-	if trace {
-		outLogger.Printf("transaction flags: %s", s.txFlags)
-	}
-
-	s.conn.inTx = false
+	s.inTx = false
 	return nil
 }
 
-//
+// decodeLobs decodes (reads from db) output lob or result lob parameters.
 
-func (s *Session) readLobStream(w lobChunkWriter) error {
+// read lob reply
+// - seems like readLobreply returns only a result for one lob - even if more then one is requested
+// --> read single lobs
+func (s *Session) decodeLobs(descr *lobOutDescr, wr io.Writer) error {
+	var err error
 
-	s.readLobRequest.w = w
-	s.readLobReply.w = w
+	if descr.isCharBased {
+		wrcl := transform.NewWriter(wr, unicode.Cesu8ToUtf8Transformer) // CESU8 transformer
+		err = s._decodeLobs(descr, wrcl, func(b []byte) (int64, error) {
+			// Caution: hdb counts 4 byte utf-8 encodings (cesu-8 6 bytes) as 2 (3 byte) chars
+			numChars := int64(0)
+			for len(b) > 0 {
+				if !cesu8.FullRune(b) { //
+					return 0, fmt.Errorf("lob chunk consists of incomplete CESU-8 runes")
+				}
+				_, size := cesu8.DecodeRune(b)
+				b = b[size:]
+				numChars++
+				if size == cesu8.CESUMax {
+					numChars++
+				}
+			}
+			return numChars, nil
+		})
+	} else {
+		err = s._decodeLobs(descr, wr, func(b []byte) (int64, error) { return int64(len(b)), nil })
+	}
 
-	for !w.eof() {
-
-		if err := s.writeRequest(mtWriteLob, false, s.readLobRequest); err != nil {
-			return err
-		}
-		if err := s.readReply(nil); err != nil {
-			return err
+	if pw, ok := wr.(*io.PipeWriter); ok { // if the writer is a pipe-end -> close at the end
+		if err != nil {
+			pw.CloseWithError(err)
+		} else {
+			pw.Close()
 		}
 	}
-	return nil
+	return err
 }
 
-func (s *Session) writeLobStream(prmFieldSet *ParameterFieldSet, prmFieldValues *FieldValues, args []driver.NamedValue) error {
+func (s *Session) _decodeLobs(descr *lobOutDescr, wr io.Writer, countChars func(b []byte) (int64, error)) error {
+	lobChunkSize := int64(s.cfg.LobChunkSize())
 
-	if s.writeLobReply.numArg == 0 {
-		return nil
-	}
-
-	lobPrmFields := make([]*ParameterField, s.writeLobReply.numArg)
-
-	j := 0
-	for _, f := range prmFieldSet.fields {
-		if f.TypeCode().isLob() && f.In() && f.chunkReader != nil {
-			f.lobLocatorID = s.writeLobReply.ids[j]
-			lobPrmFields[j] = f
-			j++
+	chunkSize := func(numChar, ofs int64) int32 {
+		chunkSize := numChar - ofs
+		if chunkSize > lobChunkSize {
+			return int32(lobChunkSize)
 		}
-	}
-	if j != s.writeLobReply.numArg {
-		return fmt.Errorf("protocol error: invalid number of lob parameter ids %d - expected %d", j, s.writeLobReply.numArg)
+		return int32(chunkSize)
 	}
 
-	s.writeLobRequest.lobPrmFields = lobPrmFields
-
-	f := func(p replyPart) {
-		if p, ok := p.(*outputParameters); ok {
-			p.s = s
-			p.outputFields = prmFieldSet.outputFields()
-			p.fieldValues = prmFieldValues
-		}
-	}
-
-	for s.writeLobReply.numArg != 0 {
-		if err := s.writeRequest(mtReadLob, false, s.writeLobRequest); err != nil {
-			return err
-		}
-
-		if err := s.readReply(f); err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
-//
-
-func (s *Session) initRequest() error {
-
-	// init
-	s.mh.sessionID = -1
-
-	// handshake
-	req := newInitRequest()
-	// TODO: constants
-	req.product.major = 4
-	req.product.minor = 20
-	req.protocol.major = 4
-	req.protocol.minor = 1
-	req.numOptions = 1
-	req.endianess = littleEndian
-	if err := req.write(s.wr); err != nil {
+	if _, err := wr.Write(descr.b); err != nil {
 		return err
 	}
 
-	rep := newInitReply()
-	if err := rep.read(s.rd); err != nil {
+	lobRequest := &readLobRequest{}
+	lobRequest.id = descr.id
+
+	lobReply := &readLobReply{}
+
+	eof := descr.opt.isLastData()
+
+	ofs, err := countChars(descr.b)
+	if err != nil {
 		return err
 	}
-	return nil
-}
 
-func (s *Session) writeRequest(messageType messageType, commit bool, requests ...requestPart) error {
+	for !eof {
 
-	partSize := make([]int, len(requests))
+		lobRequest.ofs += ofs
+		lobRequest.chunkSize = chunkSize(descr.numChar, ofs)
 
-	size := int64(segmentHeaderSize + len(requests)*partHeaderSize) //int64 to hold MaxUInt32 in 32bit OS
+		if err := s.pw.write(s.sessionID, mtWriteLob, false, lobRequest); err != nil {
+			return err
+		}
 
-	for i, part := range requests {
-		s, err := part.size()
+		if err := s.pr.iterateParts(func(ph *partHeader) {
+			if ph.partKind == pkReadLobReply {
+				s.pr.read(lobReply)
+			}
+		}); err != nil {
+			return err
+		}
+
+		if lobReply.id != lobRequest.id {
+			return fmt.Errorf("internal error: invalid lob locator %d - expected %d", lobReply.id, lobRequest.id)
+		}
+
+		if _, err := wr.Write(lobReply.b); err != nil {
+			return err
+		}
+
+		ofs, err = countChars(lobReply.b)
 		if err != nil {
 			return err
 		}
-		size += int64(s + padBytes(s))
-		partSize[i] = s // buffer size (expensive calculation)
+		eof = lobReply.opt.isLastData()
 	}
-
-	if size > math.MaxUint32 {
-		return fmt.Errorf("message size %d exceeds maximum message header value %d", size, int64(math.MaxUint32)) //int64: without cast overflow error in 32bit OS
-	}
-
-	bufferSize := size
-
-	s.mh.varPartLength = uint32(size)
-	s.mh.varPartSize = uint32(bufferSize)
-	s.mh.noOfSegm = 1
-
-	if err := s.mh.write(s.wr); err != nil {
-		return err
-	}
-
-	if size > math.MaxInt32 {
-		return fmt.Errorf("message size %d exceeds maximum part header value %d", size, math.MaxInt32)
-	}
-
-	s.sh.messageType = messageType
-	s.sh.commit = commit
-	s.sh.segmentKind = skRequest
-	s.sh.segmentLength = int32(size)
-	s.sh.segmentOfs = 0
-	s.sh.noOfParts = int16(len(requests))
-	s.sh.segmentNo = 1
-
-	if err := s.sh.write(s.wr); err != nil {
-		return err
-	}
-
-	bufferSize -= segmentHeaderSize
-
-	for i, part := range requests {
-
-		size := partSize[i]
-		pad := padBytes(size)
-
-		s.ph.partKind = part.kind()
-		numArg := part.numArg()
-		switch {
-		default:
-			return fmt.Errorf("maximum number of arguments %d exceeded", numArg)
-		case numArg <= math.MaxInt16:
-			s.ph.argumentCount = int16(numArg)
-			s.ph.bigArgumentCount = 0
-
-		// TODO: seems not to work: see bulk insert test
-		case numArg <= math.MaxInt32:
-			s.ph.argumentCount = 0
-			s.ph.bigArgumentCount = int32(numArg)
-		}
-
-		s.ph.bufferLength = int32(size)
-		s.ph.bufferSize = int32(bufferSize)
-
-		if err := s.ph.write(s.wr); err != nil {
-			return err
-		}
-
-		if err := part.write(s.wr); err != nil {
-			return err
-		}
-
-		s.wr.WriteZeroes(pad)
-
-		bufferSize -= int64(partHeaderSize + size + pad)
-
-	}
-
-	return s.wr.Flush()
-
+	return nil
 }
 
-func (s *Session) readReply(beforeRead beforeRead) error {
+// encodeLobs encodes (write to db) input lob parameters.
+func (s *Session) encodeLobs(cr *callResult, ids []locatorID, inPrmFields []*parameterField, args []driver.NamedValue) error {
 
-	replyRowsAffected := false
-	replyError := false
+	chunkSize := int(s.cfg.LobChunkSize())
 
-	if err := s.mh.read(s.rd); err != nil {
-		return err
+	readers := make([]io.Reader, 0, len(ids))
+	descrs := make([]*writeLobDescr, 0, len(ids))
+
+	j := 0
+	for i, f := range inPrmFields {
+		if f.tc.isLob() {
+			rd, ok := args[i].Value.(io.Reader)
+			if !ok {
+				return fmt.Errorf("protocol error: invalid lob parameter %[1]T %[1]v - io.Reader expected", args[i].Value)
+			}
+			if f.tc.isCharBased() {
+				rd = transform.NewReader(rd, unicode.Utf8ToCesu8Transformer) // CESU8 transformer
+			}
+			if j >= len(ids) {
+				return fmt.Errorf("protocol error: invalid number of lob parameter ids %d", len(ids))
+			}
+			readers = append(readers, rd)
+			descrs = append(descrs, &writeLobDescr{id: ids[j]})
+			j++
+		}
 	}
-	if s.mh.noOfSegm != 1 {
-		return fmt.Errorf("simple message: no of segments %d - expected 1", s.mh.noOfSegm)
-	}
-	if err := s.sh.read(s.rd); err != nil {
-		return err
-	}
 
-	// TODO: protocol error (sps 82)?: message header varPartLength < segment header segmentLength (*1)
-	diff := int(s.mh.varPartLength) - int(s.sh.segmentLength)
-	if trace && diff != 0 {
-		outLogger.Printf("+++++diff %d", diff)
-	}
+	writeLobRequest := &writeLobRequest{}
 
-	noOfParts := int(s.sh.noOfParts)
-	lastPart := noOfParts - 1
+	for len(descrs) != 0 {
 
-	for i := 0; i < noOfParts; i++ {
+		if len(descrs) != len(ids) {
+			return fmt.Errorf("protocol error: invalid number of lob parameter ids %d - expected %d", len(descrs), len(ids))
+		}
+		for i, descr := range descrs { // check if ids and descrs are in sync
+			if descr.id != ids[i] {
+				return fmt.Errorf("protocol error: lob parameter id mismatch %d - expected %d", descr.id, ids[i])
+			}
+		}
 
-		if err := s.ph.read(s.rd); err != nil {
+		// TODO check total size limit
+		for i, descr := range descrs {
+			descr.b = make([]byte, chunkSize)
+			size, err := readers[i].Read(descr.b)
+			descr.b = descr.b[:size]
+			if err != nil && err != io.EOF {
+				return err
+			}
+			descr.ofs = -1 //offset (-1 := append)
+			descr.opt = loDataincluded
+			if err == io.EOF {
+				descr.opt |= loLastdata
+			}
+		}
+
+		writeLobRequest.descrs = descrs
+
+		if err := s.pw.write(s.sessionID, mtReadLob, false, writeLobRequest); err != nil {
 			return err
 		}
 
-		numArg := int(s.ph.argumentCount)
+		lobReply := &writeLobReply{}
+		outPrms := &outputParameters{}
 
-		var part replyPart
-
-		switch s.ph.partKind {
-
-		case pkAuthentication:
-			if s.scramsha256InitialReply != nil { // first call: initial reply
-				part = s.scramsha256InitialReply
-			} else { // second call: final reply
-				part = s.scramsha256FinalReply
+		if err := s.pr.iterateParts(func(ph *partHeader) {
+			switch ph.partKind {
+			case pkOutputParameters:
+				outPrms.outputFields = cr.outputFields
+				s.pr.read(outPrms)
+				cr.fieldValues = outPrms.fieldValues
+			case pkWriteLobReply:
+				s.pr.read(lobReply)
+				ids = lobReply.ids
 			}
-		case pkTopologyInformation:
-			part = s.topologyInformation
-		case pkConnectOptions:
-			part = s.connectOptions
-		case pkStatementID:
-			part = s.statementID
-		case pkResultMetadata:
-			part = s.resultMetadata
-		case pkResultsetID:
-			part = s.resultsetID
-		case pkResultset:
-			part = s.resultset
-		case pkParameterMetadata:
-			part = s.parameterMetadata
-		case pkOutputParameters:
-			part = s.outputParameters
-		case pkError:
-			replyError = true
-			part = s.lastError
-		case pkStatementContext:
-			part = s.stmtCtx
-		case pkTransactionFlags:
-			part = s.txFlags
-		case pkRowsAffected:
-			replyRowsAffected = true
-			part = s.rowsAffected
-		case pkReadLobReply:
-			part = s.readLobReply
-		case pkWriteLobReply:
-			part = s.writeLobReply
-		default:
-			return fmt.Errorf("read not expected part kind %s", s.ph.partKind)
-		}
-
-		part.setNumArg(numArg)
-
-		if beforeRead != nil {
-			beforeRead(part)
-		}
-
-		s.rd.ResetCnt()
-		if err := part.read(s.rd); err != nil {
+		}); err != nil {
 			return err
 		}
-		cnt := s.rd.Cnt()
 
-		switch {
-		case cnt < int(s.ph.bufferLength): // protocol buffer length > read bytes -> skip the unread bytes
-			s.rd.Skip(int(s.ph.bufferLength) - cnt)
-		case cnt > int(s.ph.bufferLength): // read bytes > protocol buffer length -> should never happen
-			return fmt.Errorf("protocol error: read bytes %d > buffer length %d", cnt, s.ph.bufferLength)
-		}
-
-		if i != lastPart { // not last part
-			s.rd.Skip(padBytes(int(s.ph.bufferLength)))
-		}
-	}
-
-	// last part
-	// TODO: workaround (see *)
-	if diff == 0 {
-		s.rd.Skip(padBytes(int(s.ph.bufferLength)))
-	}
-
-	if err := s.rd.GetError(); err != nil {
-		return err
-	}
-
-	if replyError {
-		if replyRowsAffected { //link statement to error
-			j := 0
-			for i, rows := range s.rowsAffected.rows {
-				if rows == raExecutionFailed {
-					s.lastError.setStmtNo(j, i)
-					j++
-				}
+		// remove done descr and readers
+		j := 0
+		for i, descr := range descrs {
+			if !descr.opt.isLastData() {
+				descrs[j] = descr
+				readers[j] = readers[i]
+				j++
 			}
 		}
-		if s.lastError.isWarnings() {
-			for _, _error := range s.lastError.errors {
-				sqltrace.Traceln(_error)
-			}
-			return nil
-		}
-		return s.lastError
+		descrs = descrs[:j]
+		readers = readers[:j]
 	}
 	return nil
 }

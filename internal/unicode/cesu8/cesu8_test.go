@@ -39,16 +39,16 @@ type testCP struct {
 
 // see http://en.wikipedia.org/wiki/CESU-8
 var testCPData = []*testCP{
-	&testCP{0x45, []byte{0x45}},
-	&testCP{0x205, []byte{0xc8, 0x85}},
-	&testCP{0x10400, []byte{0xed, 0xa0, 0x81, 0xed, 0xb0, 0x80}},
+	{0x45, []byte{0x45}},
+	{0x205, []byte{0xc8, 0x85}},
+	{0x10400, []byte{0xed, 0xa0, 0x81, 0xed, 0xb0, 0x80}},
 }
 
 func TestCP(t *testing.T) {
 	b := make([]byte, CESUMax)
 	for _, d := range testCPData {
 		n1 := EncodeRune(b, d.cp)
-		if bytes.Compare(b[:n1], d.utf8) != 0 {
+		if !bytes.Equal(b[:n1], d.utf8) {
 			t.Logf("encode code point %x char %c cesu-8 %x - expected %x", d.cp, d.cp, b[:n1], d.utf8)
 		} else {
 			t.Logf("encode code point %x char %c cesu-8 %x", d.cp, d.cp, b[:n1])
